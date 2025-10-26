@@ -1,0 +1,259 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: drl-scheduler-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: drl-scheduler
+  namespace: drl-scheduler-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: drl-scheduler
+rules:
+  # Pods
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/binding"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["patch", "update"]
+  # Nodes
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  # Events
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch", "update"]
+  # PersistentVolumeClaims
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+  # Services
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]
+  # ReplicationControllers
+  - apiGroups: [""]
+    resources: ["replicationcontrollers"]
+    verbs: ["get", "list", "watch"]
+  # StatefulSets
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch"]
+  # ReplicaSets
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: drl-scheduler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: drl-scheduler
+subjects:
+  - kind: ServiceAccount
+    name: drl-scheduler
+    namespace: drl-scheduler-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: drl-scheduler-config
+  namespace: drl-scheduler-system
+data:
+  scheduler.yaml: |
+    schedulerName: drl-scheduler
+    enableTraining: true
+    trainingInterval: 100
+    learningRate: 0.0003
+    gamma: 0.99
+    rewardWeights:
+      resourceUtilization: 0.3
+      loadBalance: 0.25
+      latency: 0.25
+      affinity: 0.1
+      energy: 0.1
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: drl-scheduler-models
+  namespace: drl-scheduler-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: drl-scheduler
+  namespace: drl-scheduler-system
+  labels:
+    app: drl-scheduler
+    component: scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: drl-scheduler
+      component: scheduler
+  template:
+    metadata:
+      labels:
+        app: drl-scheduler
+        component: scheduler
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: drl-scheduler
+      containers:
+        - name: scheduler
+          image: gcr.io/PROJECT_ID/drl-scheduler:latest
+          imagePullPolicy: Always
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: IN_CLUSTER
+              value: "true"
+            - name: ENABLE_TRAINING
+              value: "true"
+            - name: TRAINING_INTERVAL
+              value: "100"
+            - name: LEARNING_RATE
+              value: "0.0003"
+            - name: GAMMA
+              value: "0.99"
+            - name: API_PORT
+              value: "8000"
+            - name: METRICS_PORT
+              value: "9090"
+            - name: MODEL_PATH
+              value: "/app/models"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: ENABLE_TENSORBOARD
+              value: "true"
+            - name: TENSORBOARD_DIR
+              value: "/app/logs/tensorboard"
+            # Reward weights
+            - name: REWARD_RESOURCE_UTIL
+              value: "0.3"
+            - name: REWARD_LOAD_BALANCE
+              value: "0.25"
+            - name: REWARD_LATENCY
+              value: "0.25"
+            - name: REWARD_AFFINITY
+              value: "0.1"
+            - name: REWARD_ENERGY
+              value: "0.1"
+          ports:
+            - name: api
+              containerPort: 8000
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: api
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readiness
+              port: api
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: 2000m
+              memory: 4Gi
+          volumeMounts:
+            - name: models
+              mountPath: /app/models
+            - name: logs
+              mountPath: /app/logs
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: drl-scheduler-models
+        - name: logs
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: drl-scheduler
+  namespace: drl-scheduler-system
+  labels:
+    app: drl-scheduler
+spec:
+  type: ClusterIP
+  ports:
+    - name: api
+      port: 8000
+      targetPort: api
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+      protocol: TCP
+  selector:
+    app: drl-scheduler
+    component: scheduler
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: drl-scheduler-metrics
+  namespace: drl-scheduler-system
+  labels:
+    app: drl-scheduler
+spec:
+  type: ClusterIP
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
+  selector:
+    app: drl-scheduler
+    component: scheduler
